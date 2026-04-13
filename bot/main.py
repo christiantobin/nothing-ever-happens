@@ -429,20 +429,34 @@ async def _run_longshot_fade() -> None:
 
     heartbeat = None
     dashboard_task = None
+    sync_task = None
     dashboard_port = os.getenv("PORT") or os.getenv("DASHBOARD_PORT")
     if dashboard_port:
         try:
-            from bot.dashboard import HeartbeatTracker, run_longshot_fade_dashboard
+            from bot.dashboard import DashboardServer, HeartbeatTracker
+            from bot.kalshi_portfolio_sync import run_portfolio_sync
+            from bot.portfolio_state import PortfolioState
 
             heartbeat = HeartbeatTracker()
-            dashboard_task = asyncio.create_task(
-                run_longshot_fade_dashboard(
-                    port=int(dashboard_port),
-                    heartbeat=heartbeat,
-                    scan_interval_seconds=cfg.scan_interval_seconds,
-                    portfolio=portfolio,
+            dashboard_portfolio_state = PortfolioState()
+
+            dashboard = DashboardServer(
+                port=int(dashboard_port),
+                portfolio_state=dashboard_portfolio_state,
+                exchange=client,
+                async_balance_provider=getattr(client, "get_balance", None),
+                skip_resolutions=True,
+            )
+            dashboard_task = asyncio.create_task(dashboard.run(), name="dashboard")
+            sync_task = asyncio.create_task(
+                run_portfolio_sync(
+                    client,
+                    dashboard_portfolio_state,
+                    longshot_portfolio=portfolio,
+                    balance_getter=getattr(client, "get_balance", None),
+                    poll_interval_seconds=max(5.0, cfg.scan_interval_seconds / 2.0),
                 ),
-                name="dashboard",
+                name="portfolio_sync",
             )
             logger.info("dashboard_starting", extra={"port": int(dashboard_port)})
         except Exception:
@@ -464,8 +478,9 @@ async def _run_longshot_fade() -> None:
     finally:
         if hasattr(client, "close"):
             await client.close()
-        if dashboard_task is not None:
-            dashboard_task.cancel()
+        for t in (dashboard_task, sync_task):
+            if t is not None:
+                t.cancel()
 
 
 def main():

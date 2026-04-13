@@ -34,12 +34,16 @@ class DashboardServer:
         exchange=None,
         portfolio_state=None,
         nothing_happens_control: NothingHappensControlState | None = None,
+        async_balance_provider=None,
+        skip_resolutions: bool = False,
     ):
         self.host = host
         self.port = port
         self._exchange = exchange
         self._portfolio_state = portfolio_state
         self._nothing_happens_control = nothing_happens_control
+        self._async_balance_provider = async_balance_provider
+        self._skip_resolutions = skip_resolutions
         self._clients: set[web.WebSocketResponse] = set()
         self._last_portfolio_version = -1
         self._last_nothing_happens_control_version = -1
@@ -148,7 +152,8 @@ class DashboardServer:
             await self._broadcast(portfolio_message)
         await self._poll_trades()
         await self._poll_balance()
-        await self._poll_resolutions()
+        if not self._skip_resolutions:
+            await self._poll_resolutions()
 
     def _make_portfolio_message(self, *, force: bool = False) -> dict | None:
         if self._portfolio_state is None:
@@ -256,17 +261,23 @@ class DashboardServer:
         }
 
     async def _poll_balance(self) -> None:
-        if self._exchange is None:
-            return
         loop_now = asyncio.get_running_loop().time()
         if loop_now - self._last_balance_poll < BALANCE_POLL_INTERVAL_SEC:
             return
         self._last_balance_poll = loop_now
         try:
-            balance = await asyncio.wait_for(
-                asyncio.to_thread(self._exchange.get_collateral_balance),
-                timeout=BALANCE_TIMEOUT_SEC,
-            )
+            if self._async_balance_provider is not None:
+                balance = await asyncio.wait_for(
+                    self._async_balance_provider(),
+                    timeout=BALANCE_TIMEOUT_SEC,
+                )
+            elif self._exchange is not None:
+                balance = await asyncio.wait_for(
+                    asyncio.to_thread(self._exchange.get_collateral_balance),
+                    timeout=BALANCE_TIMEOUT_SEC,
+                )
+            else:
+                return
             if self._starting_balance is None:
                 self._starting_balance = balance
                 logger.info(
