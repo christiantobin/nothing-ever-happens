@@ -183,3 +183,44 @@ async def test_scan_once_continues_after_order_error():
     # First call errored, remaining candidates still attempted.
     assert call_count["n"] >= 2
     assert n == call_count["n"] - 1
+
+
+# ---- LongshotFadePortfolio adapter ---------------------------------------
+
+
+def test_portfolio_tracks_entries():
+    from bot.strategy.longshot_fade import LongshotFadePortfolio
+
+    p = LongshotFadePortfolio(store=None)
+    assert p.held_market_tickers() == set()
+    assert p.current_exposure() == 0.0
+
+    p.record_entry(
+        token_id="E1-A:no", event_ticker="E1",
+        price=0.08, contracts=10, estimated_fee=0.05, order_id="oid-1",
+    )
+    p.record_entry(
+        token_id="E1-B:no", event_ticker="E1",
+        price=0.05, contracts=20, estimated_fee=0.05, order_id="oid-2",
+    )
+    assert p.held_market_tickers() == {"E1-A", "E1-B"}
+    # 0.08 * 10 + 0.05 * 20 = 1.80
+    assert p.current_exposure() == pytest.approx(1.80)
+
+
+def test_portfolio_records_to_store():
+    from bot.strategy.longshot_fade import LongshotFadePortfolio
+    from unittest.mock import MagicMock
+
+    store = MagicMock()
+    p = LongshotFadePortfolio(store=store)
+    p.record_entry(
+        token_id="E1-A:no", event_ticker="E1",
+        price=0.08, contracts=10, estimated_fee=0.05, order_id="oid-1",
+    )
+    store.record_order.assert_called_once()
+    call = store.record_order.call_args.kwargs
+    assert call["order_id"] == "oid-1"
+    assert call["token_id"] == "E1-A:no"
+    assert call["price"] == 0.08
+    assert call["size"] == 10.0

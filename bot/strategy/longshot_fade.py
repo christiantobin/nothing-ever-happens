@@ -31,6 +31,77 @@ class EntryCandidate:
     token_id: str
 
 
+class LongshotFadePortfolio:
+    """In-memory portfolio tracker for the longshot fade loop.
+
+    Tracks which market tickers are currently held and the dollar exposure.
+    Persists entries via an injected ``OrderStore`` so restart recovery can
+    rebuild this state from the database.
+    """
+
+    def __init__(self, store=None) -> None:
+        self._store = store
+        self._entries: dict[str, tuple[float, int]] = {}  # token_id -> (price, contracts)
+
+    def held_market_tickers(self) -> set[str]:
+        return {tid.split(":", 1)[0] for tid in self._entries}
+
+    def current_exposure(self) -> float:
+        return sum(price * contracts for price, contracts in self._entries.values())
+
+    def record_entry(
+        self,
+        *,
+        token_id: str,
+        event_ticker: str,
+        price: float,
+        contracts: int,
+        estimated_fee: float,
+        order_id: str,
+    ) -> None:
+        self._entries[token_id] = (price, contracts)
+        if self._store is not None:
+            from bot.models import Side
+
+            try:
+                self._store.record_order(
+                    order_id=order_id,
+                    token_id=token_id,
+                    side=Side.BUY,
+                    price=price,
+                    size=float(contracts),
+                    status="submitted",
+                )
+            except Exception:
+                logger.exception(
+                    "store.record_order failed",
+                    extra={"order_id": order_id, "token_id": token_id},
+                )
+
+    def hydrate_from_store(self, store) -> None:
+        """Rebuild in-memory state from OrderStore open orders at startup."""
+        self._entries.clear()
+        for row in _iter_open_longshot_entries(store):
+            self._entries[row["token_id"]] = (float(row["price"]), int(row["size"]))
+
+
+def _iter_open_longshot_entries(store):
+    """Yield {token_id, price, size} dicts for open BUY orders with NO side tokens."""
+    from bot.db import orders_table
+    import sqlalchemy as sa
+
+    with store.engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(orders_table).where(
+                orders_table.c.status.in_(("submitted", "open", "live", "partially_filled")),
+                orders_table.c.side == "BUY",
+                orders_table.c.token_id.like("%:no"),
+            )
+        ).mappings()
+        for row in rows:
+            yield {"token_id": row["token_id"], "price": row["price"], "size": row["size"]}
+
+
 def select_entry_candidates(
     events: list[MultiOutcomeEvent],
     config: LongshotFadeConfig,
