@@ -262,3 +262,62 @@ def _validate_nothing_happens_config(cfg: NothingHappensConfig) -> None:
         raise ValueError(f"max_new_positions must be >= -1, got {cfg.max_new_positions}")
     if cfg.redeemer_interval_sec < 60:
         raise ValueError(f"redeemer_interval_sec must be >= 60, got {cfg.redeemer_interval_sec}")
+
+
+@dataclass(frozen=True)
+class LongshotFadeConfig:
+    price_cap: float
+    max_capital_per_outcome: float
+    max_capital_per_event: float
+    max_total_exposure: float
+    min_time_to_resolution_hours: int
+    max_time_to_resolution_days: int
+    min_outcomes_in_event: int
+    scan_interval_seconds: int
+
+
+def load_longshot_fade_config(config_path: str | None = None) -> LongshotFadeConfig:
+    """Load longshot_fade config from a JSON file.
+
+    If ``config_path`` is None, falls back to ``CONFIG_PATH`` env var or ``config.json``.
+    """
+    path = Path(config_path or os.getenv("CONFIG_PATH", "config.json"))
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {path}. "
+            f"Copy config.example.json to config.json and fill in your values."
+        )
+    with path.open() as f:
+        data = json.load(f)
+    raw = data["strategies"]["longshot_fade"]
+    cfg = LongshotFadeConfig(
+        price_cap=float(raw["price_cap"]),
+        max_capital_per_outcome=float(raw["max_capital_per_outcome"]),
+        max_capital_per_event=float(raw["max_capital_per_event"]),
+        max_total_exposure=float(raw["max_total_exposure"]),
+        min_time_to_resolution_hours=int(raw["min_time_to_resolution_hours"]),
+        max_time_to_resolution_days=int(raw["max_time_to_resolution_days"]),
+        min_outcomes_in_event=int(raw["min_outcomes_in_event"]),
+        scan_interval_seconds=int(raw["scan_interval_seconds"]),
+    )
+    _validate_longshot_fade(cfg)
+    return cfg
+
+
+def _validate_longshot_fade(cfg: "LongshotFadeConfig") -> None:
+    if not (0 < cfg.price_cap <= 1.0):
+        raise ValueError(f"price_cap must be in (0, 1.0], got {cfg.price_cap}")
+    if cfg.max_capital_per_outcome <= 0:
+        raise ValueError("max_capital_per_outcome must be > 0")
+    if cfg.max_capital_per_event < cfg.max_capital_per_outcome:
+        raise ValueError("max_capital_per_event must be >= max_capital_per_outcome")
+    if cfg.max_total_exposure < cfg.max_capital_per_event:
+        raise ValueError("max_total_exposure must be >= max_capital_per_event")
+    if cfg.min_time_to_resolution_hours < 0:
+        raise ValueError("min_time_to_resolution_hours must be >= 0")
+    if cfg.max_time_to_resolution_days <= 0:
+        raise ValueError("max_time_to_resolution_days must be > 0")
+    if cfg.min_outcomes_in_event < 2:
+        raise ValueError("min_outcomes_in_event must be >= 2")
+    if cfg.scan_interval_seconds < 5:
+        raise ValueError("scan_interval_seconds must be >= 5")
