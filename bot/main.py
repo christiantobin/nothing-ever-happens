@@ -360,9 +360,121 @@ async def run():
     logger.info("shutdown_complete")
 
 
-def main():
+def _build_kalshi_exchange(allow_trading: bool):
+    """Build a KalshiExchangeClient from env vars, or PaperExchangeClient if unset."""
+    from bot.exchange.kalshi import KalshiEnv, KalshiExchangeClient
+
+    access_id = os.environ.get("KALSHI_ACCESS_KEY_ID", "").strip()
+    key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip()
+    env_name = os.environ.get("KALSHI_ENV", "demo").strip().lower()
+    if not access_id or not key_path:
+        logger.warning("Kalshi credentials missing; falling back to PaperExchangeClient")
+        return PaperExchangeClient()
     try:
-        asyncio.run(run())
+        env = KalshiEnv(env_name)
+    except ValueError:
+        raise ValueError(f"KALSHI_ENV must be 'demo' or 'prod', got {env_name!r}")
+    return KalshiExchangeClient(
+        access_key_id=access_id,
+        private_key_path=key_path,
+        env=env,
+        allow_trading=allow_trading,
+    )
+
+
+async def _run_longshot_fade() -> None:
+    load_dotenv()
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+
+    from bot.config import load_longshot_fade_config
+    from bot.strategy.longshot_fade import (
+        LongshotFadePortfolio,
+        run_forever,
+    )
+
+    cfg_path = os.getenv("CONFIG_PATH", "config.json")
+    cfg = load_longshot_fade_config(cfg_path)
+
+    allow_trading = (
+        os.getenv("BOT_MODE", "").strip().lower() == "live"
+        and os.getenv("LIVE_TRADING_ENABLED", "").strip().lower() == "true"
+        and os.getenv("DRY_RUN", "").strip().lower() == "false"
+    )
+
+    client = _build_kalshi_exchange(allow_trading=allow_trading)
+
+    database_url = os.getenv("DATABASE_URL")
+    store = None
+    if database_url:
+        from bot.db import create_engine as create_db_engine
+        from bot.store import OrderStore
+        from bot.trade_ledger import init_db
+
+        init_db(database_url)
+        store = OrderStore(create_db_engine(database_url))
+
+    portfolio = LongshotFadePortfolio(store=store)
+    if store is not None:
+        try:
+            portfolio.hydrate_from_store(store)
+            logger.info(
+                "longshot_fade_hydrated",
+                extra={"held": len(portfolio.held_market_tickers())},
+            )
+        except Exception:
+            logger.exception("longshot_fade_hydrate_failed")
+
+    def get_paused() -> bool:
+        return bool(os.getenv("TRADING_PAUSED", "").strip())
+
+    heartbeat = None
+    dashboard_task = None
+    dashboard_port = os.getenv("PORT") or os.getenv("DASHBOARD_PORT")
+    if dashboard_port:
+        try:
+            from bot.dashboard import HeartbeatTracker, run_longshot_fade_dashboard
+
+            heartbeat = HeartbeatTracker()
+            dashboard_task = asyncio.create_task(
+                run_longshot_fade_dashboard(
+                    port=int(dashboard_port),
+                    heartbeat=heartbeat,
+                    scan_interval_seconds=cfg.scan_interval_seconds,
+                    portfolio=portfolio,
+                ),
+                name="dashboard",
+            )
+            logger.info("dashboard_starting", extra={"port": int(dashboard_port)})
+        except Exception:
+            logger.exception("dashboard_start_failed")
+
+    logger.info(
+        "longshot_fade_starting",
+        extra={
+            "kalshi_env": os.getenv("KALSHI_ENV", "demo"),
+            "allow_trading": allow_trading,
+            "price_cap": cfg.price_cap,
+            "max_total_exposure": cfg.max_total_exposure,
+            "scan_interval_seconds": cfg.scan_interval_seconds,
+        },
+    )
+
+    try:
+        await run_forever(client, cfg, portfolio, get_paused, heartbeat=heartbeat)
+    finally:
+        if hasattr(client, "close"):
+            await client.close()
+        if dashboard_task is not None:
+            dashboard_task.cancel()
+
+
+def main():
+    strategy = os.environ.get("STRATEGY", "nothing_happens").strip().lower()
+    try:
+        if strategy == "longshot_fade":
+            asyncio.run(_run_longshot_fade())
+        else:
+            asyncio.run(run())
     except KeyboardInterrupt:
         pass
 
