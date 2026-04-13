@@ -85,47 +85,77 @@ async def discover_multi_outcome_events(
     cursor: str | None = None
 
     for _ in range(max_pages):
-        params: dict[str, Any] = {"status": "open", "with_nested_markets": "true"}
-        if cursor:
-            params["cursor"] = cursor
-        resp = await client._signed_request("GET", "/events", params=params)
-
-        for ev in resp.get("events", []):
+        resp = await client.list_events(
+            status="open",
+            with_nested_markets=True,
+            cursor=cursor,
+            limit=200,
+        )
+        raw_events = _response_events(resp)
+        for ev in raw_events:
             parsed = _parse_event(ev, min_outcomes=min_outcomes)
             if parsed is not None:
                 events.append(parsed)
 
-        cursor = resp.get("cursor") or None
+        cursor = _response_cursor(resp)
         if not cursor:
             break
 
     return events
 
 
+def _response_events(resp: Any) -> list[Any]:
+    """Extract the events list from a Kalshi events response (dict or SDK model)."""
+    if resp is None:
+        return []
+    if isinstance(resp, dict):
+        return resp.get("events", []) or []
+    return getattr(resp, "events", []) or []
+
+
+def _response_cursor(resp: Any) -> str | None:
+    if resp is None:
+        return None
+    if isinstance(resp, dict):
+        return resp.get("cursor") or None
+    return getattr(resp, "cursor", None) or None
+
+
+def _get(obj: Any, name: str, default: Any = None) -> Any:
+    """Attr or dict accessor for SDK model or plain dict events/markets."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def _parse_event(
-    ev: dict[str, Any],
+    ev: Any,
     *,
     min_outcomes: int,
 ) -> MultiOutcomeEvent | None:
-    raw_markets = [m for m in ev.get("markets", []) if m.get("status") == "active"]
+    raw_markets = [
+        m for m in (_get(ev, "markets", []) or []) if _get(m, "status") == "active"
+    ]
     if len(raw_markets) < min_outcomes:
         return None
 
     markets: list[MultiOutcomeMarket] = []
     for m in raw_markets:
-        close_time = _parse_close_time(m.get("close_time"))
+        close_time = _parse_close_time(_get(m, "close_time"))
         if close_time is None:
             continue
-        no_ask = _parse_dollars(m.get("no_ask_dollars"))
+        no_ask = _parse_dollars(_get(m, "no_ask_dollars"))
         if no_ask is None:
             continue
         markets.append(
             MultiOutcomeMarket(
-                ticker=m["ticker"],
-                status=m["status"],
+                ticker=_get(m, "ticker"),
+                status=_get(m, "status"),
                 close_time=close_time,
                 no_ask=no_ask,
-                no_bid_size=_parse_size(m.get("no_bid_size_fp")),
+                no_bid_size=_parse_size(_get(m, "no_bid_size_fp")),
                 orderbook={"yes": [], "no": []},
             )
         )
@@ -133,8 +163,9 @@ def _parse_event(
     if len(markets) < min_outcomes:
         return None
 
+    event_ticker = _get(ev, "event_ticker", "")
     return MultiOutcomeEvent(
-        event_ticker=ev["event_ticker"],
-        title=ev.get("title", ev["event_ticker"]),
+        event_ticker=event_ticker,
+        title=_get(ev, "title", event_ticker) or event_ticker,
         markets=tuple(markets),
     )

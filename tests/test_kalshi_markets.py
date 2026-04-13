@@ -5,7 +5,14 @@ import pytest
 from bot.kalshi_markets import discover_multi_outcome_events
 
 
-def _make_market(ticker, *, no_ask="0.08", no_bid_size="100", close_time="2030-01-01T00:00:00Z", status="active"):
+def _make_market(
+    ticker,
+    *,
+    no_ask="0.08",
+    no_bid_size="100",
+    close_time="2030-01-01T00:00:00Z",
+    status="active",
+):
     return {
         "ticker": ticker,
         "status": status,
@@ -18,7 +25,7 @@ def _make_market(ticker, *, no_ask="0.08", no_bid_size="100", close_time="2030-0
 @pytest.mark.asyncio
 async def test_discover_filters_by_outcome_count():
     client = MagicMock()
-    client._signed_request = AsyncMock(
+    client.list_events = AsyncMock(
         return_value={
             "events": [
                 {
@@ -49,7 +56,7 @@ async def test_discover_filters_by_outcome_count():
 @pytest.mark.asyncio
 async def test_discover_skips_inactive_markets():
     client = MagicMock()
-    client._signed_request = AsyncMock(
+    client.list_events = AsyncMock(
         return_value={
             "events": [
                 {
@@ -71,9 +78,6 @@ async def test_discover_skips_inactive_markets():
 
 @pytest.mark.asyncio
 async def test_discover_paginates_to_cursor_exhaustion():
-    client = MagicMock()
-
-    call_count = {"n": 0}
     pages = [
         {
             "events": [
@@ -105,12 +109,15 @@ async def test_discover_paginates_to_cursor_exhaustion():
         },
     ]
 
-    async def fake(method, path, **kw):
+    call_count = {"n": 0}
+
+    async def fake_list_events(**kwargs):
         idx = call_count["n"]
         call_count["n"] += 1
         return pages[idx]
 
-    client._signed_request = fake
+    client = MagicMock()
+    client.list_events = fake_list_events
     events = await discover_multi_outcome_events(client, min_outcomes=3)
     assert {e.event_ticker for e in events} == {"E1", "E2"}
     assert call_count["n"] == 2
@@ -119,7 +126,7 @@ async def test_discover_paginates_to_cursor_exhaustion():
 @pytest.mark.asyncio
 async def test_discover_skips_markets_missing_price_or_close_time():
     client = MagicMock()
-    client._signed_request = AsyncMock(
+    client.list_events = AsyncMock(
         return_value={
             "events": [
                 {

@@ -1,22 +1,35 @@
-"""Kalshi exchange client implementing bot.exchange.base.ExchangeClient.
+"""Kalshi exchange client backed by the official ``kalshi_python_async`` SDK.
 
-See docs/kalshi-api-reference.md for endpoint paths, auth, and fee schema.
+Implements ``bot.exchange.base.ExchangeClient`` and adds a few passthrough helpers
+used by the dashboard (``get_balance``, ``get_positions``, etc.). The SDK handles
+request signing, retries, and schema migrations — we just translate between
+Kalshi's typed models and this repo's ``bot.models`` dataclasses.
 
-Kalshi token_id convention used here: ``"{market_ticker}:{side}"`` where side is
-``"yes"`` or ``"no"``. The ExchangeClient Protocol takes opaque token_ids.
+See docs/kalshi-api-reference.md for endpoint paths and the flagged fee
+coefficient.
+
+Token ID convention used across this codebase: ``"{market_ticker}:{side}"``
+where side is ``"yes"`` or ``"no"``.
 """
 from __future__ import annotations
 
-import asyncio
 import enum
 import logging
 import math
-import time
 from typing import Any
 
-import aiohttp
+from kalshi_python_async import (
+    ApiException,
+    Configuration,
+    EventsApi,
+    ExchangeApi,
+    KalshiClient,
+    MarketApi,
+    OrdersApi,
+    PortfolioApi,
+)
+from kalshi_python_async.auth import KalshiAuth  # SDK omits this from its __init__
 
-from bot.exchange.kalshi_auth import KalshiSigner
 from bot.models import (
     LimitOrderIntent,
     MarketOrderIntent,
@@ -37,15 +50,9 @@ class KalshiEnv(str, enum.Enum):
 
 
 _BASE_URLS = {
-    KalshiEnv.DEMO: "https://demo-api.kalshi.co",
-    KalshiEnv.PROD: "https://api.elections.kalshi.com",
+    KalshiEnv.DEMO: "https://demo-api.kalshi.co/trade-api/v2",
+    KalshiEnv.PROD: "https://api.elections.kalshi.com/trade-api/v2",
 }
-
-_API_PREFIX = "/trade-api/v2"
-
-
-class KalshiApiError(Exception):
-    pass
 
 
 def _parse_token_id(token_id: str) -> tuple[str, str]:
@@ -55,36 +62,32 @@ def _parse_token_id(token_id: str) -> tuple[str, str]:
     return market_ticker, side
 
 
-def _ask_price_cents(orderbook: dict[str, Any], side: str) -> int | None:
-    """Derive best ask for the given side from Kalshi bid-only orderbook.
-
-    Kalshi returns yes_bids and no_bids only. A YES bid at X is equivalent to a
-    NO ask at (100 - X), and vice versa.
-    """
-    if side == "no":
-        yes_bids = orderbook.get("yes") or []
-        if not yes_bids:
-            return None
-        return 100 - yes_bids[0][0]
-    no_bids = orderbook.get("no") or []
-    if not no_bids:
-        return None
-    return 100 - no_bids[0][0]
+def _to_dollars(value: Any) -> float:
+    """Kalshi exposes prices either as integer cents or FixedPointDollars strings."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Cents when > 1 (e.g. 88), dollars when <= 1.0.
+        return float(value) / 100.0 if value > 1 else float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _bid_price_cents(orderbook: dict[str, Any], side: str) -> int | None:
-    bids = orderbook.get(side) or []
-    if not bids:
-        return None
-    return bids[0][0]
+def _attr(obj: Any, name: str, default: Any = None) -> Any:
+    """Get attribute from SDK model or dict-like response."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 class KalshiExchangeClient:
-    """Async Kalshi trade API client.
+    """Async Kalshi trade API client backed by the official SDK.
 
-    Construct with explicit credentials; the main runtime resolves env vars and
-    passes them in. Call ``close()`` before disposal (no async context manager
-    provided because the Protocol clients are not used that way elsewhere).
+    Call ``close()`` before disposal.
     """
 
     def __init__(
@@ -94,68 +97,26 @@ class KalshiExchangeClient:
         env: KalshiEnv = KalshiEnv.DEMO,
         allow_trading: bool = False,
     ):
-        self._signer = KalshiSigner(access_key_id=access_key_id, private_key_path=private_key_path)
-        self._base_url = _BASE_URLS[env]
         self._env = env
         self._allow_trading = allow_trading
-        self._session: aiohttp.ClientSession | None = None
 
-    # ---- HTTP plumbing -----------------------------------------------------
+        config = Configuration(host=_BASE_URLS[env])
+        self._client = KalshiClient(config)
+        # Work around SDK 3.2.0 bugs: set_kalshi_auth() has a NameError
+        # (KalshiAuth not imported) and passes the path through as if it were
+        # PEM content. Read the PEM ourselves and construct KalshiAuth.
+        with open(private_key_path, "r") as f:
+            pem = f.read()
+        self._client.kalshi_auth = KalshiAuth(access_key_id, pem)
 
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    async def _signed_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict | None = None,
-        json_body: dict | None = None,
-    ) -> Any:
-        full_path = path if path.startswith(_API_PREFIX) else f"{_API_PREFIX}{path}"
-        session = await self._ensure_session()
-        url = f"{self._base_url}{full_path}"
-
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            headers = self._signer.sign(
-                timestamp_ms=int(time.time() * 1000),
-                method=method,
-                path=full_path,
-            )
-            try:
-                async with session.request(
-                    method, url, headers=headers, params=params, json=json_body
-                ) as resp:
-                    if resp.status == 429:
-                        retry_after = float(resp.headers.get("Retry-After", "1"))
-                        await asyncio.sleep(retry_after)
-                        continue
-                    if 500 <= resp.status < 600 and attempt < 2:
-                        await asyncio.sleep(0.5 * (2 ** attempt))
-                        continue
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        raise KalshiApiError(f"{method} {full_path} -> {resp.status}: {body}")
-                    if resp.status == 204:
-                        return None
-                    return await resp.json()
-            except aiohttp.ClientError as exc:
-                last_exc = exc
-                if attempt < 2:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
-                    continue
-                raise KalshiApiError(f"{method} {full_path} network error: {exc}") from exc
-
-        raise KalshiApiError(f"{method} {full_path} retries exhausted: {last_exc}")
+        self._markets = MarketApi(self._client)
+        self._events = EventsApi(self._client)
+        self._orders = OrdersApi(self._client)
+        self._portfolio = PortfolioApi(self._client)
+        self._exchange = ExchangeApi(self._client)
 
     async def close(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        await self._client.close()
 
     # ---- ExchangeClient Protocol ------------------------------------------
 
@@ -165,76 +126,88 @@ class KalshiExchangeClient:
 
     async def get_mid_price(self, token_id: str) -> float:
         market_ticker, side = _parse_token_id(token_id)
-        resp = await self._signed_request("GET", f"/markets/{market_ticker}/orderbook")
-        book = resp["orderbook"]
-        bid = _bid_price_cents(book, side)
-        ask = _ask_price_cents(book, side)
-        if bid is None and ask is None:
+        resp = await self._markets.get_market(market_ticker)
+        m = _attr(resp, "market")
+        if m is None:
             return 0.0
-        if bid is None:
-            return ask / 100.0
-        if ask is None:
-            return bid / 100.0
-        return ((bid + ask) / 2.0) / 100.0
+        if side == "no":
+            bid = _to_dollars(_attr(m, "no_bid_dollars") or _attr(m, "no_bid"))
+            ask = _to_dollars(_attr(m, "no_ask_dollars") or _attr(m, "no_ask"))
+        else:
+            bid = _to_dollars(_attr(m, "yes_bid_dollars") or _attr(m, "yes_bid"))
+            ask = _to_dollars(_attr(m, "yes_ask_dollars") or _attr(m, "yes_ask"))
+        if bid <= 0 and ask <= 0:
+            return 0.0
+        if bid <= 0:
+            return ask
+        if ask <= 0:
+            return bid
+        return (bid + ask) / 2.0
 
     async def get_market_rules(self, token_id: str) -> MarketRules | None:
         market_ticker, _ = _parse_token_id(token_id)
         try:
-            resp = await self._signed_request("GET", f"/markets/{market_ticker}")
-        except KalshiApiError:
+            resp = await self._markets.get_market(market_ticker)
+        except ApiException:
             return None
-        market = resp.get("market")
-        if not market or market.get("status") != "active":
+        m = _attr(resp, "market")
+        if m is None or _attr(m, "status") != "active":
             return None
-        return MarketRules(tick_size=0.01, min_order_size=1.0)
+        tick_size = _to_dollars(_attr(m, "tick_size") or 1)
+        return MarketRules(tick_size=tick_size or 0.01, min_order_size=1.0)
 
     async def get_open_orders(self, token_id: str) -> list[OpenOrder]:
         market_ticker, side = _parse_token_id(token_id)
-        resp = await self._signed_request(
-            "GET",
-            "/portfolio/orders",
-            params={"ticker": market_ticker, "status": "resting"},
-        )
+        try:
+            resp = await self._orders.get_orders(ticker=market_ticker, status="resting")
+        except ApiException:
+            return []
+        orders = _attr(resp, "orders", []) or []
         out: list[OpenOrder] = []
-        for o in resp.get("orders", []):
-            if o.get("side") != side:
+        for o in orders:
+            if _attr(o, "side") != side:
                 continue
-            price_cents = o.get("no_price") if side == "no" else o.get("yes_price")
-            action = o.get("action", "buy")
+            action = _attr(o, "action", "buy")
+            price_cents = (
+                _attr(o, "no_price") if side == "no" else _attr(o, "yes_price")
+            )
             out.append(
                 OpenOrder(
-                    order_id=o.get("order_id") or o.get("id"),
+                    order_id=_attr(o, "order_id") or _attr(o, "id"),
                     token_id=token_id,
                     side=Side.BUY if action == "buy" else Side.SELL,
                     price=(price_cents or 0) / 100.0,
-                    size_matched=float(o.get("filled_volume", 0) or 0),
-                    original_size=float(o.get("count", 0) or 0),
-                    status=o.get("status"),
+                    size_matched=float(_attr(o, "filled_volume", 0) or 0),
+                    original_size=float(_attr(o, "count", 0) or 0),
+                    status=_attr(o, "status"),
                 )
             )
         return out
 
     async def get_order(self, order_id: str) -> OpenOrder | None:
         try:
-            resp = await self._signed_request("GET", f"/portfolio/orders/{order_id}")
-        except KalshiApiError as exc:
-            if " 404" in str(exc):
+            resp = await self._orders.get_order(order_id)
+        except ApiException as exc:
+            if getattr(exc, "status", None) == 404:
                 return None
             raise
-        o = resp.get("order")
-        if not o:
+        o = _attr(resp, "order")
+        if o is None:
             return None
-        side = o["side"]
-        price_cents = o.get("no_price") if side == "no" else o.get("yes_price")
-        action = o.get("action", "buy")
+        side = _attr(o, "side")
+        action = _attr(o, "action", "buy")
+        price_cents = (
+            _attr(o, "no_price") if side == "no" else _attr(o, "yes_price")
+        )
+        ticker = _attr(o, "ticker") or _attr(o, "market_ticker") or ""
         return OpenOrder(
-            order_id=o.get("order_id") or o.get("id"),
-            token_id=f"{o['ticker']}:{side}",
+            order_id=_attr(o, "order_id") or _attr(o, "id"),
+            token_id=f"{ticker}:{side}",
             side=Side.BUY if action == "buy" else Side.SELL,
             price=(price_cents or 0) / 100.0,
-            size_matched=float(o.get("filled_volume", 0) or 0),
-            original_size=float(o.get("count", 0) or 0),
-            status=o.get("status"),
+            size_matched=float(_attr(o, "filled_volume", 0) or 0),
+            original_size=float(_attr(o, "count", 0) or 0),
+            status=_attr(o, "status"),
         )
 
     async def place_limit_order(self, order: LimitOrderIntent) -> OrderResult:
@@ -254,11 +227,11 @@ class KalshiExchangeClient:
             body["no_price"] = price_cents
         else:
             body["yes_price"] = price_cents
-        resp = await self._signed_request("POST", "/portfolio/orders", json_body=body)
-        o = resp["order"]
+        resp = await self._orders.create_order(**body)
+        o = _attr(resp, "order")
         return OrderResult(
-            order_id=o.get("order_id") or o.get("id"),
-            status=o.get("status", ""),
+            order_id=_attr(o, "order_id") or _attr(o, "id") or "",
+            status=_attr(o, "status", ""),
             raw=o,
         )
 
@@ -274,11 +247,11 @@ class KalshiExchangeClient:
             "count": int(order.size),
             "time_in_force": "immediate_or_cancel",
         }
-        resp = await self._signed_request("POST", "/portfolio/orders", json_body=body)
-        o = resp["order"]
+        resp = await self._orders.create_order(**body)
+        o = _attr(resp, "order")
         return OrderResult(
-            order_id=o.get("order_id") or o.get("id"),
-            status=o.get("status", ""),
+            order_id=_attr(o, "order_id") or _attr(o, "id") or "",
+            status=_attr(o, "status", ""),
             raw=o,
         )
 
@@ -286,29 +259,36 @@ class KalshiExchangeClient:
         self, token_id: str, after_timestamp: int | None = None
     ) -> list[Trade]:
         market_ticker, side = _parse_token_id(token_id)
-        params: dict[str, Any] = {"ticker": market_ticker}
-        if after_timestamp is not None:
-            params["min_ts"] = after_timestamp
-        resp = await self._signed_request("GET", "/portfolio/fills", params=params)
-        trades: list[Trade] = []
-        for f in resp.get("fills", []):
-            if f.get("side") != side:
+        try:
+            resp = await self._portfolio.get_fills(
+                ticker=market_ticker,
+                min_ts=after_timestamp,
+            )
+        except ApiException:
+            return []
+        fills = _attr(resp, "fills", []) or []
+        out: list[Trade] = []
+        for f in fills:
+            if _attr(f, "side") != side:
                 continue
-            price_cents = f.get("no_price") if side == "no" else f.get("yes_price")
-            action = f.get("action", "buy")
-            trades.append(
+            action = _attr(f, "action", "buy")
+            price_cents = (
+                _attr(f, "no_price") if side == "no" else _attr(f, "yes_price")
+            )
+            out.append(
                 Trade(
-                    trade_id=f.get("trade_id") or f.get("id"),
-                    order_id=f.get("order_id", ""),
+                    trade_id=_attr(f, "trade_id") or _attr(f, "id") or "",
+                    order_id=_attr(f, "order_id", "") or "",
                     token_id=token_id,
                     side=Side.BUY if action == "buy" else Side.SELL,
                     price=(price_cents or 0) / 100.0,
-                    size=float(f.get("count", 0) or 0),
-                    fee=float(f.get("fee_cents", 0) or 0) / 100.0,
-                    timestamp=f.get("created_time_unix") or f.get("created_time"),
+                    size=float(_attr(f, "count", 0) or 0),
+                    fee=float(_attr(f, "fee_cents", 0) or 0) / 100.0,
+                    timestamp=_attr(f, "created_time_unix")
+                    or _attr(f, "created_time"),
                 )
             )
-        return trades
+        return out
 
     async def check_order_readiness(
         self, order: LimitOrderIntent | MarketOrderIntent
@@ -323,36 +303,131 @@ class KalshiExchangeClient:
 
     async def cancel_order(self, order_id: str) -> bool:
         try:
-            await self._signed_request("DELETE", f"/portfolio/orders/{order_id}")
+            await self._orders.cancel_order(order_id)
             return True
-        except KalshiApiError:
+        except ApiException:
             logger.exception("cancel_order failed", extra={"order_id": order_id})
             return False
 
     async def cancel_all(self) -> bool:
         try:
-            resp = await self._signed_request(
-                "GET", "/portfolio/orders", params={"status": "resting"}
-            )
-        except KalshiApiError:
+            resp = await self._orders.get_orders(status="resting")
+        except ApiException:
             return False
+        orders = _attr(resp, "orders", []) or []
         ok = True
-        for o in resp.get("orders", []):
-            oid = o.get("order_id") or o.get("id")
+        for o in orders:
+            oid = _attr(o, "order_id") or _attr(o, "id")
             if oid:
                 ok = await self.cancel_order(oid) and ok
         return ok
 
-    # ---- Fee estimation ----------------------------------------------------
+    # ---- Dashboard passthroughs -------------------------------------------
+
+    async def get_balance(self) -> float:
+        """Current cash balance in dollars."""
+        try:
+            resp = await self._portfolio.get_balance()
+        except ApiException:
+            return 0.0
+        # SDK returns balance in cents.
+        raw = _attr(resp, "balance", 0) or 0
+        return float(raw) / 100.0 if raw > 1 else float(raw)
+
+    async def get_positions(self) -> list[dict]:
+        """Current open market positions. Returns a list of dicts for dashboard use."""
+        try:
+            resp = await self._portfolio.get_positions()
+        except ApiException:
+            return []
+        positions = _attr(resp, "market_positions", []) or []
+        out: list[dict] = []
+        for p in positions:
+            out.append(
+                {
+                    "ticker": _attr(p, "ticker", ""),
+                    "event_ticker": _attr(p, "event_ticker", ""),
+                    "position": int(_attr(p, "position", 0) or 0),
+                    "market_exposure": float(_attr(p, "market_exposure", 0) or 0),
+                    "realized_pnl": float(_attr(p, "realized_pnl", 0) or 0),
+                    "total_traded": float(_attr(p, "total_traded", 0) or 0),
+                    "resting_orders_count": int(
+                        _attr(p, "resting_orders_count", 0) or 0
+                    ),
+                }
+            )
+        return out
+
+    async def get_exchange_status(self) -> dict:
+        try:
+            resp = await self._exchange.get_exchange_status()
+        except ApiException:
+            return {"trading_active": False, "exchange_active": False}
+        return {
+            "trading_active": bool(_attr(resp, "trading_active", False)),
+            "exchange_active": bool(_attr(resp, "exchange_active", False)),
+        }
+
+    # ---- Event discovery (used by kalshi_markets.py) ----------------------
+
+    async def list_events(
+        self,
+        *,
+        status: str = "open",
+        with_nested_markets: bool = True,
+        cursor: str | None = None,
+        limit: int = 200,
+    ) -> dict:
+        """Fetch open events with nested markets.
+
+        Uses the SDK's auth-configured REST transport but bypasses the pydantic
+        response models — the SDK rejects responses with null values in fields
+        its schema marks non-null, which Kalshi's demo returns for many events.
+        We only need a few fields per market, so a dict response is sufficient.
+        """
+        import json
+
+        params: list[tuple[str, str]] = [
+            ("status", status),
+            ("with_nested_markets", "true" if with_nested_markets else "false"),
+            ("limit", str(limit)),
+        ]
+        if cursor:
+            params.append(("cursor", cursor))
+        query = "&".join(f"{k}={v}" for k, v in params)
+
+        base = self._client.configuration.host.rstrip("/")
+        url = f"{base}/events?{query}"
+        # Signature is computed over the path WITHOUT query params.
+        sign_path = f"{_path_from_host(base)}/events"
+        headers = self._client.kalshi_auth.create_auth_headers("GET", sign_path)
+        headers["accept"] = "application/json"
+
+        response = await self._client.rest_client.request(
+            "GET", url, headers=headers, _request_timeout=30
+        )
+        raw = await response.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if not raw:
+            return {"events": [], "cursor": None}
+        return json.loads(raw)
+
+    # ---- Fee estimation ---------------------------------------------------
 
     def estimate_fee(self, price: float, contracts: int) -> float:
         """Kalshi trading fee estimate.
 
         Formula: ``ceil(0.07 * price * (1 - price) * contracts * 100) / 100``.
-        The coefficient is flagged for verification in docs/kalshi-api-reference.md;
-        update here if Kalshi publishes a different value. ``price`` is in dollars
-        (0.00–1.00), result is in dollars rounded up to the nearest cent.
+        Verify coefficient against live Kalshi fees before production (see
+        docs/kalshi-api-reference.md).
         """
         raw_cents = 0.07 * price * (1.0 - price) * contracts * 100.0
-        # Guard against floating-point noise (e.g. 0.63000000000001 -> 0.64).
         return math.ceil(round(raw_cents, 6)) / 100.0
+
+
+def _path_from_host(host: str) -> str:
+    """Extract the path portion of a base URL (e.g., ``/trade-api/v2``)."""
+    from urllib.parse import urlparse
+
+    return urlparse(host).path.rstrip("/")
