@@ -338,3 +338,80 @@ class DashboardServer:
             await self._poll_loop()
         finally:
             await runner.cleanup()
+
+
+# ---- Longshot fade minimal dashboard (Kalshi runtime) -------------------
+
+class HeartbeatTracker:
+    """Tracks the last scan-loop tick for the /health endpoint."""
+
+    def __init__(self) -> None:
+        self._last_tick: float = 0.0
+
+    def tick(self) -> None:
+        self._last_tick = time.monotonic()
+
+    def age_seconds(self) -> float:
+        if self._last_tick == 0.0:
+            return float("inf")
+        return time.monotonic() - self._last_tick
+
+
+def build_longshot_fade_app(
+    *,
+    heartbeat: HeartbeatTracker,
+    scan_interval_seconds: int,
+    portfolio=None,
+) -> web.Application:
+    app = web.Application()
+
+    async def health(request):
+        age = heartbeat.age_seconds()
+        threshold = 2 * scan_interval_seconds
+        if age > threshold:
+            return web.Response(
+                status=503,
+                text=f"stale: last tick {age:.0f}s ago (threshold {threshold}s)",
+            )
+        return web.Response(status=200, text="ok")
+
+    async def status(request):
+        body = {
+            "scan_interval_seconds": scan_interval_seconds,
+            "heartbeat_age_seconds": heartbeat.age_seconds()
+            if heartbeat._last_tick
+            else None,
+        }
+        if portfolio is not None:
+            body["held_market_tickers"] = sorted(portfolio.held_market_tickers())
+            body["current_exposure"] = round(portfolio.current_exposure(), 4)
+        return web.json_response(body)
+
+    app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
+    return app
+
+
+async def run_longshot_fade_dashboard(
+    *,
+    port: int,
+    heartbeat: HeartbeatTracker,
+    scan_interval_seconds: int,
+    portfolio=None,
+    host: str = "0.0.0.0",
+) -> None:
+    app = build_longshot_fade_app(
+        heartbeat=heartbeat,
+        scan_interval_seconds=scan_interval_seconds,
+        portfolio=portfolio,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    logger.info("Longshot fade dashboard at http://%s:%d", host, port)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
