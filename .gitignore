@@ -54,3 +54,9 @@ resolved_markets.json
 reconstruct_pnl_actual.csv
 *.parquet
 .claude/
+
+# Kalshi local test artifacts
+*.pem
+bot.db
+bot.db.bak
+logs/
