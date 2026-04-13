@@ -1,0 +1,18 @@
+[Unit]
+Description=Nothing Ever Happens Kalshi Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/nothing-ever-happens
+EnvironmentFile=/home/pi/nothing-ever-happens/.env
+ExecStart=/home/pi/nothing-ever-happens/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/pi/nothing-ever-happens/logs/bot.log
+StandardError=append:/home/pi/nothing-ever-happens/logs/bot.log
+
+[Install]
+WantedBy=multi-user.target
