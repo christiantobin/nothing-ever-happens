@@ -116,16 +116,9 @@ Runs every `SCAN_INTERVAL_SECONDS` (default 30):
    - Apply all risk controls (per-event cap, global exposure cap, min liquidity at top of book)
    - If all gates pass: place single limit buy on NO at `no_ask`
 
-### Entry Gate (after all filters pass)
+### Entry Gate
 
-```python
-cost_without_fees = no_ask * contracts
-fee = client.estimate_fee(no_ask, contracts)
-expected_payoff_if_nothing_happens = contracts  # NO pays $1 on non-resolution
-expected_edge = (1 - no_ask) * contracts - fee
-if expected_edge < min_edge_dollars:
-    skip
-```
+Single rule: `no_ask ≤ price_cap` and monetary caps not exceeded. Estimated fee is computed and logged for every entry (for P&L attribution), but is not a gate — the price cap already encodes the edge assumption.
 
 ### Position Lifecycle
 
@@ -146,11 +139,10 @@ All configurable via `config.json` under `strategies.longshot_fade`:
 | `max_total_exposure` | `$250` | 50% bankroll ceiling |
 | `min_time_to_resolution` | `24h` | Avoid same-day resolution with no "nothing happens" runway |
 | `max_time_to_resolution` | `90 days` | Capital opportunity cost |
-| `min_outcomes_in_event` | `3` | Binaries are out of scope (would belong to a Kalshi port of `nothing_happens`) |
-| `max_outcomes_in_event` | `30` | Avoid pathological events with hundreds of arms |
-| `min_top_of_book_size` | `1 contract` | Must actually fill at ask |
-| `min_edge_dollars` | `$0.50` | After fees, absolute floor to prevent churn |
+| `min_outcomes_in_event` | `3` | Binaries are out of scope |
 | `scan_interval_seconds` | `30` | Arbs persist; no HFT needed |
+
+**Philosophy:** Every rule above is a **hard mechanical cap or binary filter**. No runtime judgment, no "is this edge good enough" gates. If the price cap is met and the monetary caps aren't exceeded, the bot trades. Operator mindset stays consistent: commit to "nothing ever happens," let the numbers do the work. Fees are logged on every entry for after-the-fact P&L attribution, not gated on at entry time (price cap already bakes in the edge assumption).
 
 Reuses existing `bot/risk_controls.py` for: daily loss cap, global kill switch, `TRADING_PAUSED` env-var pause.
 
@@ -186,9 +178,6 @@ Backup: daily cron `sqlite3 bot.db ".backup bot.db.bak"` on the Pi, rotated week
       "min_time_to_resolution_hours": 24,
       "max_time_to_resolution_days": 90,
       "min_outcomes_in_event": 3,
-      "max_outcomes_in_event": 30,
-      "min_top_of_book_size": 1,
-      "min_edge_dollars": 0.50,
       "scan_interval_seconds": 30
     }
   }
@@ -247,13 +236,11 @@ WantedBy=multi-user.target
 
 Before the scan loop starts, `main.py` verifies:
 
-1. Clock offset vs NTP < 5s (via `ntpstat` or a sentinel HTTP request and response time delta)
-2. Kalshi API reachable (`GET /exchange/status`)
-3. Fee formula matches hardcoded expectation (fetch a known test market, compute expected fee, compare against a known value)
-4. DB schema current (sqlalchemy migration check)
-5. `TRADING_PAUSED` is respected from the start
+1. Kalshi API reachable (`GET /exchange/status`)
+2. DB schema current (sqlalchemy migration check)
+3. `TRADING_PAUSED` is respected from the start
 
-Any failure → log, post to webhook, halt (do not trade).
+Any failure → log, post to webhook, halt (do not trade). No brittle sanity checks (e.g. "fee formula matches hardcoded value") — if Kalshi changes the formula, logged fees and P&L will surface the change faster than a synthetic pre-flight check would.
 
 ## Testing
 
