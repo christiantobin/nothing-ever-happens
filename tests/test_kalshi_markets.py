@@ -5,6 +5,16 @@ import pytest
 from bot.kalshi_markets import discover_multi_outcome_events
 
 
+def _make_market(ticker, *, no_ask="0.08", no_bid_size="100", close_time="2030-01-01T00:00:00Z", status="active"):
+    return {
+        "ticker": ticker,
+        "status": status,
+        "close_time": close_time,
+        "no_ask_dollars": no_ask,
+        "no_bid_size_fp": no_bid_size,
+    }
+
+
 @pytest.mark.asyncio
 async def test_discover_filters_by_outcome_count():
     client = MagicMock()
@@ -15,46 +25,24 @@ async def test_discover_filters_by_outcome_count():
                     "event_ticker": "KXPRES28",
                     "title": "2028 President",
                     "markets": [
-                        {
-                            "ticker": "KXPRES28-HARRIS",
-                            "status": "active",
-                            "close_time": "2028-11-05T00:00:00Z",
-                            "orderbook": {"yes": [[12, 100]], "no": [[85, 100]]},
-                        },
-                        {
-                            "ticker": "KXPRES28-NEWSOM",
-                            "status": "active",
-                            "close_time": "2028-11-05T00:00:00Z",
-                            "orderbook": {"yes": [[8, 100]], "no": [[90, 100]]},
-                        },
-                        {
-                            "ticker": "KXPRES28-SHAPIRO",
-                            "status": "active",
-                            "close_time": "2028-11-05T00:00:00Z",
-                            "orderbook": {"yes": [[5, 100]], "no": [[94, 100]]},
-                        },
+                        _make_market("KXPRES28-HARRIS", no_ask="0.88"),
+                        _make_market("KXPRES28-NEWSOM", no_ask="0.92"),
+                        _make_market("KXPRES28-SHAPIRO", no_ask="0.95"),
                     ],
                 },
                 {
                     "event_ticker": "BINARY-X",
                     "title": "Binary example",
-                    "markets": [
-                        {
-                            "ticker": "BINARY-X-Y",
-                            "status": "active",
-                            "close_time": "2026-05-01T00:00:00Z",
-                            "orderbook": {"yes": [[50, 100]], "no": [[48, 100]]},
-                        }
-                    ],
+                    "markets": [_make_market("BINARY-X-Y", no_ask="0.52")],
                 },
-            ]
+            ],
+            "cursor": "",
         }
     )
     events = await discover_multi_outcome_events(client, min_outcomes=3)
     assert len(events) == 1
     assert events[0].event_ticker == "KXPRES28"
     assert len(events[0].markets) == 3
-    # No ask derived from YES bid: 100 - 12 = 88 cents = 0.88
     assert events[0].markets[0].no_ask == pytest.approx(0.88)
 
 
@@ -68,75 +56,87 @@ async def test_discover_skips_inactive_markets():
                     "event_ticker": "E",
                     "title": "t",
                     "markets": [
-                        {
-                            "ticker": "E-A",
-                            "status": "active",
-                            "close_time": "2030-01-01T00:00:00Z",
-                            "orderbook": {"yes": [[10, 1]], "no": [[89, 1]]},
-                        },
-                        {
-                            "ticker": "E-B",
-                            "status": "closed",
-                            "close_time": "2030-01-01T00:00:00Z",
-                            "orderbook": {},
-                        },
-                        {
-                            "ticker": "E-C",
-                            "status": "active",
-                            "close_time": "2030-01-01T00:00:00Z",
-                            "orderbook": {"yes": [[5, 1]], "no": [[94, 1]]},
-                        },
+                        _make_market("E-A", status="active"),
+                        _make_market("E-B", status="closed"),
+                        _make_market("E-C", status="active"),
                     ],
                 }
-            ]
+            ],
+            "cursor": "",
         }
     )
     events = await discover_multi_outcome_events(client, min_outcomes=3)
-    # Only 2 active, below min_outcomes=3
     assert events == []
 
 
 @pytest.mark.asyncio
-async def test_discover_fetches_missing_orderbook():
+async def test_discover_paginates_to_cursor_exhaustion():
     client = MagicMock()
 
-    calls: list[tuple[str, str]] = []
+    call_count = {"n": 0}
+    pages = [
+        {
+            "events": [
+                {
+                    "event_ticker": "E1",
+                    "title": "t",
+                    "markets": [
+                        _make_market("E1-A"),
+                        _make_market("E1-B"),
+                        _make_market("E1-C"),
+                    ],
+                }
+            ],
+            "cursor": "next-1",
+        },
+        {
+            "events": [
+                {
+                    "event_ticker": "E2",
+                    "title": "t",
+                    "markets": [
+                        _make_market("E2-A"),
+                        _make_market("E2-B"),
+                        _make_market("E2-C"),
+                    ],
+                }
+            ],
+            "cursor": "",
+        },
+    ]
 
-    async def fake_request(method, path, **kw):
-        calls.append((method, path))
-        if path == "/events":
-            return {
-                "events": [
-                    {
-                        "event_ticker": "E",
-                        "title": "t",
-                        "markets": [
-                            {
-                                "ticker": "E-A",
-                                "status": "active",
-                                "close_time": "2030-01-01T00:00:00Z",
-                            },
-                            {
-                                "ticker": "E-B",
-                                "status": "active",
-                                "close_time": "2030-01-01T00:00:00Z",
-                            },
-                            {
-                                "ticker": "E-C",
-                                "status": "active",
-                                "close_time": "2030-01-01T00:00:00Z",
-                            },
-                        ],
-                    }
-                ]
-            }
-        # orderbook fetch
-        return {"orderbook": {"yes": [[5, 10]], "no": [[94, 10]]}}
+    async def fake(method, path, **kw):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return pages[idx]
 
-    client._signed_request = fake_request
+    client._signed_request = fake
+    events = await discover_multi_outcome_events(client, min_outcomes=3)
+    assert {e.event_ticker for e in events} == {"E1", "E2"}
+    assert call_count["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_discover_skips_markets_missing_price_or_close_time():
+    client = MagicMock()
+    client._signed_request = AsyncMock(
+        return_value={
+            "events": [
+                {
+                    "event_ticker": "E",
+                    "title": "t",
+                    "markets": [
+                        _make_market("E-A", no_ask=None),
+                        _make_market("E-B", close_time=None),
+                        _make_market("E-C"),
+                        _make_market("E-D"),
+                        _make_market("E-E"),
+                    ],
+                }
+            ],
+            "cursor": "",
+        }
+    )
     events = await discover_multi_outcome_events(client, min_outcomes=3)
     assert len(events) == 1
-    assert len(events[0].markets) == 3
-    # 3 per-market orderbook calls
-    orderbook_calls = [c for c in calls if "orderbook" in c[1]]
-    assert len(orderbook_calls) == 3
+    assert {m.ticker for m in events[0].markets} == {"E-C", "E-D", "E-E"}

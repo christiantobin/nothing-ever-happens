@@ -25,13 +25,13 @@ def _cfg(**overrides):
 
 def _market(ticker: str, no_ask_cents: int, hours_out: int = 48) -> MultiOutcomeMarket:
     close = datetime.now(timezone.utc) + timedelta(hours=hours_out)
-    # Kalshi orderbook uses YES bids to imply NO asks.
-    yes_bid_cents = 100 - no_ask_cents
     return MultiOutcomeMarket(
         ticker=ticker,
         status="active",
         close_time=close,
-        orderbook={"yes": [[yes_bid_cents, 100]], "no": [[no_ask_cents - 2, 100]]},
+        no_ask=no_ask_cents / 100.0,
+        no_bid_size=100,
+        orderbook={"yes": [], "no": []},
     )
 
 

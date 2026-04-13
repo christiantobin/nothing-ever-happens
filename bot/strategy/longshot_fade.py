@@ -183,6 +183,15 @@ async def scan_once(
     exposure = portfolio.current_exposure()
 
     candidates = select_entry_candidates(events, config, held, exposure)
+    logger.info(
+        "scan_cycle",
+        extra={
+            "events": len(events),
+            "candidates": len(candidates),
+            "held": len(held),
+            "exposure": round(exposure, 2),
+        },
+    )
     placed = 0
 
     for cand in candidates:

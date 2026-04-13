@@ -469,6 +469,8 @@ async def _run_longshot_fade() -> None:
 
 
 def main():
+    # Load .env before reading STRATEGY so the env var selector sees config-file values.
+    load_dotenv()
     strategy = os.environ.get("STRATEGY", "nothing_happens").strip().lower()
     try:
         if strategy == "longshot_fade":
